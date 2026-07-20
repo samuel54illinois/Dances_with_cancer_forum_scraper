@@ -1,8 +1,17 @@
+import json
 from pathlib import Path
 
+import pytest
 from bs4 import BeautifulSoup
 
-from scraper import ForumScraper, clean_text
+from scraper import (
+    ForumScraper,
+    UnexpectedPageError,
+    clean_text,
+    load_checkpoint,
+    load_jsonl,
+    save_checkpoint,
+)
 
 
 def test_listing_extracts_normal_threads_and_ignores_sidebar():
@@ -43,3 +52,28 @@ def test_clean_text_removes_login_notice():
         "html.parser",
     ).td
     assert clean_text(node) == "真实内容\n下一行"
+
+
+def test_load_jsonl_repairs_truncated_final_line(tmp_path):
+    path = tmp_path / "threads.jsonl"
+    thread = {"thread_id": "231", "title": "肝癌"}
+    path.write_text(json.dumps(thread, ensure_ascii=False) + '\n{"thread_id":', encoding="utf-8")
+
+    assert load_jsonl(path) == [thread]
+    assert path.read_text(encoding="utf-8") == json.dumps(thread, ensure_ascii=False) + "\n"
+
+
+def test_checkpoint_round_trip_is_atomic(tmp_path):
+    path = tmp_path / "checkpoint.json"
+    state = {"status": "running", "completed_thread_count": 95}
+    save_checkpoint(path, state)
+    assert load_checkpoint(path) == state
+    assert not (tmp_path / "checkpoint.json.tmp").exists()
+
+
+def test_redirect_to_network_filter_is_rejected():
+    with pytest.raises(UnexpectedPageError, match="filtering/block page"):
+        ForumScraper._validate_destination(
+            "http://www.yuaigongwu.com/forum-145-1.html",
+            "http://10.12.55.2/disable/disable.htm",
+        )

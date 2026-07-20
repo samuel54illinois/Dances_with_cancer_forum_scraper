@@ -6,7 +6,8 @@ This scraper reads public pages from the 与癌共舞 (Yuaigongwu) Discuz forum.
 2. keeps titles containing a keyword (default: `肝癌`);
 3. visits every page of each matching thread;
 4. extracts the thread title, opening post (`theme`), and all comments;
-5. writes nested JSONL and one-post-per-row CSV.
+5. writes nested JSONL and one-post-per-row CSV after every completed thread;
+6. resumes interrupted runs using an atomic checkpoint.
 
 No browser clicking or scrolling is required because the public content is present in the HTML.
 
@@ -28,10 +29,10 @@ Scrape only the listing page supplied in the question (page 279):
 python scraper.py
 ```
 
-Test with at most one matching thread and no intentional delay:
+Test with at most one matching thread:
 
 ```bash
-python scraper.py --max-threads 1 --delay 0
+python scraper.py --max-threads 1 --delay 2 --output-dir output-smoke
 ```
 
 Scan from the first listing page through every available listing page:
@@ -40,7 +41,36 @@ Scan from the first listing page through every available listing page:
 python scraper.py \
   --forum-url http://www.yuaigongwu.com/forum-145-1.html \
   --forum-pages 0 \
-  --delay 2
+  --delay 2 \
+  --output-dir output-full
+```
+
+### Stop and resume
+
+Press `Ctrl+C` once to stop. The current completed thread, JSONL, CSV, and checkpoint are
+preserved. To continue, run the **same command with the same output directory**. Resume is
+automatic; already completed thread IDs are skipped.
+
+For the current partial full-forum run:
+
+```bash
+python scraper.py \
+  --forum-url http://www.yuaigongwu.com/forum-145-1.html \
+  --forum-pages 0 \
+  --max-threads 0 \
+  --delay 2 \
+  --output-dir output-full
+```
+
+If the process crashes or the network fails, run that command again. A thread is checkpointed
+only after all of its reply pages have been collected, so at most the in-progress thread is
+fetched again.
+
+Use `--fresh` only when you intentionally want to delete that output directory's scraper
+results and begin again:
+
+```bash
+python scraper.py --output-dir output-smoke --fresh
 ```
 
 Useful options:
@@ -49,12 +79,33 @@ Useful options:
 - `--forum-pages N`: listing pages to scan; `0` follows all remaining pages
 - `--max-threads N`: stop after N matches; `0` means unlimited
 - `--delay 1.5`: minimum delay between requests
+- `--timeout 30`: seconds to wait for a response
+- `--retries 5`: retries for timeouts, HTTP 429, and temporary server errors
+- `--backoff 3`: initial retry pause; subsequent pauses increase exponentially
 - `--output-dir output`: destination directory
+- `--fresh`: explicitly discard that destination's saved run and restart
 
 Results:
 
 - `output/threads.jsonl`: one nested object per thread, including `theme`, `opening_post`, and `comments`
 - `output/posts.csv`: one row per opening post/comment; encoded as UTF-8 with BOM for Excel
+- `output/checkpoint.json`: current listing URL, progress counts, status, and last error
+
+JSONL is the durable source of truth. At startup, CSV is rebuilt from valid JSONL records,
+which repairs a crash that happened between writing the two formats. A truncated final JSONL
+line is also removed automatically without affecting earlier completed threads.
+
+## Throttling and retries
+
+Keep a delay for a full scrape. Two seconds is a reasonable starting point for this older
+forum; three to five seconds is gentler if the server is unstable. Removing the throttle makes
+timeouts or rate limiting more likely and puts unnecessary load on the site. Requests remain
+serial—there is no parallel fetching.
+
+Temporary timeouts, HTTP 429 responses, and HTTP 5xx responses are retried with exponential
+backoff. After retries are exhausted, the run stops with its checkpoint intact. Responses
+redirected to a network-filtering host are rejected instead of being mistaken for an empty
+forum page.
 
 ## Data fields
 
