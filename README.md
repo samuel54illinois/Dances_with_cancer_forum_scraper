@@ -7,7 +7,8 @@ This scraper reads public pages from the 与癌共舞 (Yuaigongwu) Discuz forum.
 3. visits every page of each matching thread;
 4. extracts the thread title, opening post (`theme`), and all comments;
 5. writes nested JSONL and one-post-per-row CSV after every completed thread;
-6. resumes interrupted runs using an atomic checkpoint.
+6. resumes interrupted runs using an atomic checkpoint;
+7. retries blank/temporary thread responses, logs persistent failures, and continues.
 
 No browser clicking or scrolling is required because the public content is present in the HTML.
 
@@ -66,6 +67,29 @@ If the process crashes or the network fails, run that command again. A thread is
 only after all of its reply pages have been collected, so at most the in-progress thread is
 fetched again.
 
+### Failed and empty threads
+
+If a thread remains blank or invalid after all retries, the scraper writes it to both
+`failed_threads.csv` and `failed_threads.jsonl`, then continues with the next matching thread.
+It is not counted as successfully completed and does not create an empty record in
+`threads.jsonl` or `posts.csv`.
+
+Retry only unresolved failed threads later, without rescanning forum listings:
+
+```bash
+python scraper.py \
+  --forum-url http://www.yuaigongwu.com/forum-145-1.html \
+  --forum-pages 0 \
+  --delay 3 \
+  --timeout 45 \
+  --output-dir output-full \
+  --retry-failures
+```
+
+Confirmed-empty threads are intentionally skipped by that command. To explicitly check them
+again too, add `--retry-empty`. A recovered thread is appended to the valid outputs and removed
+from the current failure logs automatically.
+
 Use `--fresh` only when you intentionally want to delete that output directory's scraper
 results and begin again:
 
@@ -83,6 +107,8 @@ Useful options:
 - `--retries 5`: retries for timeouts, HTTP 429, and temporary server errors
 - `--backoff 3`: initial retry pause; subsequent pauses increase exponentially
 - `--output-dir output`: destination directory
+- `--retry-failures`: retry only unresolved entries in the failure log
+- `--retry-empty`: also retry records marked `confirmed_empty`
 - `--fresh`: explicitly discard that destination's saved run and restart
 
 Results:
@@ -90,6 +116,8 @@ Results:
 - `output/threads.jsonl`: one nested object per thread, including `theme`, `opening_post`, and `comments`
 - `output/posts.csv`: one row per opening post/comment; encoded as UTF-8 with BOM for Excel
 - `output/checkpoint.json`: current listing URL, progress counts, status, and last error
+- `output/failed_threads.csv`: human-readable unresolved/confirmed-empty thread log
+- `output/failed_threads.jsonl`: machine-readable version of the same failure log
 
 JSONL is the durable source of truth. At startup, CSV is rebuilt from valid JSONL records,
 which repairs a crash that happened between writing the two formats. A truncated final JSONL
@@ -102,10 +130,11 @@ forum; three to five seconds is gentler if the server is unstable. Removing the 
 timeouts or rate limiting more likely and puts unnecessary load on the site. Requests remain
 serial—there is no parallel fetching.
 
-Temporary timeouts, HTTP 429 responses, and HTTP 5xx responses are retried with exponential
-backoff. After retries are exhausted, the run stops with its checkpoint intact. Responses
-redirected to a network-filtering host are rejected instead of being mistaken for an empty
-forum page.
+Temporary timeouts, blank/skeleton pages, HTTP 429 responses, and HTTP 5xx responses are retried
+with exponential backoff. If retries for one thread are exhausted, that thread is logged and
+the listing crawl continues. A listing-page failure still pauses the run because skipping a
+listing page could silently omit many threads. Responses redirected to a network-filtering host
+are rejected instead of being mistaken for an empty forum page.
 
 ## Data fields
 

@@ -31,6 +31,10 @@ class UnexpectedPageError(RuntimeError):
     """The response is not the requested public forum page."""
 
 
+class RedirectedPageError(UnexpectedPageError):
+    """A network filter or unrelated host intercepted the request."""
+
+
 class RetryableResponseError(requests.RequestException):
     """The server returned a response that should be retried."""
 
@@ -100,12 +104,12 @@ class ForumScraper:
         requested_host = (urlparse(requested_url).hostname or "").removeprefix("www.")
         final_host = (urlparse(final_url).hostname or "").removeprefix("www.")
         if requested_host != final_host:
-            raise UnexpectedPageError(
+            raise RedirectedPageError(
                 f"Request was redirected away from {requested_host} to {final_host}. "
                 "This usually means the network returned a filtering/block page."
             )
 
-    def get_soup(self, url: str) -> BeautifulSoup:
+    def get_soup(self, url: str, expected: str | None = None) -> BeautifulSoup:
         attempts = self.retries + 1
         for attempt in range(1, attempts + 1):
             self._throttle()
@@ -121,16 +125,21 @@ class ForumScraper:
                 # The forum declares UTF-8. Statistical detection misidentifies
                 # these mostly-Chinese pages and produces mojibake.
                 response.encoding = response.encoding or "utf-8"
-                return BeautifulSoup(response.text, "html.parser")
+                soup = BeautifulSoup(response.text, "html.parser")
+                if expected == "listing":
+                    self.validate_listing_page(soup, url)
+                elif expected == "thread":
+                    self.validate_thread_page(soup, url)
+                return soup
             except requests.exceptions.SSLError as exc:
                 raise RuntimeError(
                     "The site's HTTPS certificate could not be verified. "
                     "Use its public HTTP URL (http://www.yuaigongwu.com/...) instead."
                 ) from exc
-            except UnexpectedPageError:
+            except RedirectedPageError:
                 raise
             except (requests.exceptions.Timeout, requests.exceptions.ConnectionError,
-                    RetryableResponseError) as exc:
+                    RetryableResponseError, UnexpectedPageError) as exc:
                 if attempt >= attempts:
                     raise RuntimeError(
                         f"Request failed after {attempts} attempt(s): {url}: {exc}"
@@ -159,7 +168,11 @@ class ForumScraper:
 
     @staticmethod
     def validate_thread_page(soup: BeautifulSoup, page_url: str) -> None:
-        if soup.select_one("#thread_subject") is None or soup.select_one("#postlist") is None:
+        if (
+            soup.select_one("#thread_subject") is None
+            or soup.select_one("#postlist") is None
+            or soup.select_one("#postlist [id^='postmessage_']") is None
+        ):
             title = soup.title.get_text(" ", strip=True) if soup.title else "untitled page"
             raise UnexpectedPageError(
                 f"Expected a thread at {page_url}, but received {title!r}."
@@ -267,8 +280,7 @@ class ForumScraper:
 
         while page_url and page_url not in visited_pages:
             visited_pages.add(page_url)
-            soup = self.get_soup(page_url)
-            self.validate_thread_page(soup, page_url)
+            soup = self.get_soup(page_url, expected="thread")
             title_node = soup.select_one("#thread_subject")
             if title_node:
                 parsed_title = title_node.get_text(" ", strip=True)
@@ -313,6 +325,23 @@ CSV_FIELDS = [
     "source_url",
 ]
 
+FAILURE_FIELDS = [
+    "thread_id",
+    "title",
+    "url",
+    "source_forum_url",
+    "status",
+    "error_type",
+    "error",
+    "attempt_count",
+    "first_failed_at",
+    "last_attempt_at",
+]
+
+
+def timestamp_now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
 
 def thread_csv_rows(thread: dict):
     posts = ([thread["opening_post"]] if thread["opening_post"] else []) + thread["comments"]
@@ -355,6 +384,16 @@ def append_thread_csv(path: Path, thread: dict) -> None:
         os.fsync(handle.fileno())
 
 
+def rewrite_jsonl(path: Path, records: list[dict]) -> None:
+    temp = path.with_suffix(path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8") as handle:
+        for record in records:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, path)
+
+
 def load_jsonl(path: Path) -> list[dict]:
     """Load durable results and repair only a truncated final line."""
     if not path.exists():
@@ -391,6 +430,56 @@ def load_jsonl(path: Path) -> list[dict]:
     return threads
 
 
+def load_failures(path: Path) -> dict[str, dict]:
+    if not path.exists():
+        return {}
+    failures: dict[str, dict] = {}
+    for index, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            failure = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid failure JSONL data at {path}:{index}") from exc
+        failures[str(failure["thread_id"])] = failure
+    return failures
+
+
+def save_failure_logs(jsonl_path: Path, csv_path: Path, failures: dict[str, dict]) -> None:
+    ordered = sorted(failures.values(), key=lambda item: int(item["thread_id"]))
+    rewrite_jsonl(jsonl_path, ordered)
+    temp = csv_path.with_suffix(csv_path.suffix + ".tmp")
+    with temp.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FAILURE_FIELDS)
+        writer.writeheader()
+        writer.writerows(ordered)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temp, csv_path)
+
+
+def failure_record(
+    link: ThreadLink,
+    error: Exception | str,
+    previous: dict | None = None,
+    status: str = "failed",
+) -> dict:
+    now = timestamp_now()
+    error_type = type(error).__name__ if isinstance(error, Exception) else status
+    return {
+        "thread_id": link.thread_id,
+        "title": link.title,
+        "url": link.url,
+        "source_forum_url": link.source_forum_url,
+        "status": status,
+        "error_type": error_type,
+        "error": str(error),
+        "attempt_count": int((previous or {}).get("attempt_count", 0)) + 1,
+        "first_failed_at": (previous or {}).get("first_failed_at", now),
+        "last_attempt_at": now,
+    }
+
+
 def save_checkpoint(path: Path, state: dict) -> None:
     temp = path.with_suffix(path.suffix + ".tmp")
     with temp.open("w", encoding="utf-8") as handle:
@@ -425,6 +514,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backoff", type=float, default=3.0, help="initial retry backoff seconds")
     parser.add_argument("--output-dir", type=Path, default=Path("output"))
     parser.add_argument(
+        "--retry-failures",
+        action="store_true",
+        help="retry unresolved threads in failed_threads.jsonl without scanning listings",
+    )
+    parser.add_argument(
+        "--retry-empty",
+        action="store_true",
+        help="with --retry-failures, also retry quarantined empty threads",
+    )
+    parser.add_argument(
         "--fresh",
         action="store_true",
         help="discard this output directory's checkpoint/results and start over",
@@ -437,22 +536,64 @@ def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if min(args.forum_pages, args.max_threads, args.retries) < 0:
         raise SystemExit("--forum-pages, --max-threads, and --retries must be zero or positive")
+    if args.retry_empty and not args.retry_failures:
+        raise SystemExit("--retry-empty must be used together with --retry-failures")
 
     output_dir: Path = args.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
     jsonl_path = output_dir / "threads.jsonl"
     csv_path = output_dir / "posts.csv"
     checkpoint_path = output_dir / "checkpoint.json"
+    failure_jsonl_path = output_dir / "failed_threads.jsonl"
+    failure_csv_path = output_dir / "failed_threads.csv"
 
     if args.fresh:
-        for path in (jsonl_path, csv_path, checkpoint_path):
+        for path in (
+            jsonl_path,
+            csv_path,
+            checkpoint_path,
+            failure_jsonl_path,
+            failure_csv_path,
+        ):
             path.unlink(missing_ok=True)
 
     threads = load_jsonl(jsonl_path)
+    failures = load_failures(failure_jsonl_path)
+
+    # Old scraper versions could save a thread object with no posts when the
+    # forum returned a blank/skeleton page. Quarantine those records so they do
+    # not inflate the completed count or silently disappear from posts.csv.
+    valid_threads: list[dict] = []
+    quarantined = 0
+    for thread in threads:
+        if thread.get("opening_post") or thread.get("comments"):
+            valid_threads.append(thread)
+            continue
+        link = ThreadLink(
+            str(thread["thread_id"]),
+            str(thread.get("title", "")),
+            str(thread.get("url", "")),
+            str(thread.get("source_forum_url", "")),
+        )
+        failures[link.thread_id] = failure_record(
+            link,
+            "Confirmed empty thread: no opening post or comments were available.",
+            previous=failures.get(link.thread_id),
+            status="confirmed_empty",
+        )
+        quarantined += 1
+    if quarantined:
+        threads = valid_threads
+        rewrite_jsonl(jsonl_path, threads)
+        logging.warning(
+            "Quarantined %s empty thread record(s) into the failure log.", quarantined
+        )
+
     completed_ids = {str(thread["thread_id"]) for thread in threads}
     # Always rebuild CSV at startup. This repairs a crash between the durable
     # JSONL append and the corresponding CSV append.
     write_csv(csv_path, threads)
+    save_failure_logs(failure_jsonl_path, failure_csv_path, failures)
 
     checkpoint = load_checkpoint(checkpoint_path)
     if checkpoint:
@@ -463,15 +604,88 @@ def main() -> int:
             )
         page_url = checkpoint.get("current_forum_url")
         pages_completed = int(checkpoint.get("listing_pages_completed", 0))
-        if checkpoint.get("status") == "complete" and page_url is None:
+        if (
+            not args.retry_failures
+            and checkpoint.get("status") in {"complete", "complete_with_failures"}
+            and page_url is None
+        ):
             print(
                 f"Already complete: {len(threads)} thread(s). Use --fresh to start over.\n"
-                f"JSONL: {jsonl_path}\nCSV:   {csv_path}\nCheckpoint: {checkpoint_path}"
+                f"JSONL: {jsonl_path}\nCSV:   {csv_path}\nCheckpoint: {checkpoint_path}\n"
+                f"Failures: {failure_csv_path}"
             )
             return 0
     else:
         page_url = args.forum_url
         pages_completed = 0
+
+    scraper = ForumScraper(
+        delay=args.delay,
+        timeout=args.timeout,
+        retries=args.retries,
+        backoff=args.backoff,
+    )
+
+    if args.retry_failures:
+        eligible = [
+            failure
+            for failure in failures.values()
+            if args.retry_empty or failure.get("status") != "confirmed_empty"
+        ]
+        attempted = succeeded = 0
+        interrupted = False
+        for previous in sorted(eligible, key=lambda item: int(item["thread_id"])):
+            link = ThreadLink(
+                str(previous["thread_id"]),
+                str(previous.get("title", "")),
+                str(previous.get("url", "")),
+                str(previous.get("source_forum_url", "")),
+            )
+            if link.thread_id in completed_ids:
+                failures.pop(link.thread_id, None)
+                continue
+            logging.info('RETRY FAILED THREAD [%s] "%s"', link.thread_id, link.title)
+            attempted += 1
+            try:
+                thread = scraper.scrape_thread(link)
+                append_thread_jsonl(jsonl_path, thread)
+                append_thread_csv(csv_path, thread)
+                threads.append(thread)
+                completed_ids.add(link.thread_id)
+                failures.pop(link.thread_id, None)
+                succeeded += 1
+            except KeyboardInterrupt:
+                interrupted = True
+                logging.warning("Stopped by user; failure-retry progress is saved.")
+                break
+            except RedirectedPageError as exc:
+                interrupted = True
+                logging.error("Failure retry stopped by a network redirect: %s", exc)
+                break
+            except Exception as exc:
+                keep_status = (
+                    "confirmed_empty"
+                    if previous.get("status") == "confirmed_empty"
+                    else "failed"
+                )
+                failures[link.thread_id] = failure_record(
+                    link, exc, previous=previous, status=keep_status
+                )
+                logging.error("THREAD STILL FAILED [%s]: %s", link.thread_id, exc)
+            finally:
+                save_failure_logs(failure_jsonl_path, failure_csv_path, failures)
+
+        if checkpoint:
+            checkpoint["completed_thread_count"] = len(completed_ids)
+            checkpoint["failed_thread_count"] = len(failures)
+            checkpoint["updated_at"] = timestamp_now()
+            save_checkpoint(checkpoint_path, checkpoint)
+        print(
+            f"Failure retry finished: attempted {attempted}, recovered {succeeded}, "
+            f"remaining {len(failures)}.\n"
+            f"JSONL: {jsonl_path}\nCSV:   {csv_path}\nFailures: {failure_csv_path}"
+        )
+        return 130 if interrupted else 0
 
     state = {
         "version": 1,
@@ -480,19 +694,14 @@ def main() -> int:
         "current_forum_url": page_url,
         "listing_pages_completed": pages_completed,
         "completed_thread_count": len(completed_ids),
+        "failed_thread_count": len(failures),
         "status": "running",
         "last_error": None,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "updated_at": timestamp_now(),
     }
     save_checkpoint(checkpoint_path, state)
-
-    scraper = ForumScraper(
-        delay=args.delay,
-        timeout=args.timeout,
-        retries=args.retries,
-        backoff=args.backoff,
-    )
     pages_seen_this_run: set[str] = set()
+    failed_this_run: set[str] = set()
     exit_code = 0
     try:
         while page_url and page_url not in pages_seen_this_run:
@@ -504,27 +713,60 @@ def main() -> int:
                 break
 
             state["current_forum_url"] = page_url
-            state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            state["updated_at"] = timestamp_now()
             save_checkpoint(checkpoint_path, state)
             pages_seen_this_run.add(page_url)
-            soup = scraper.get_soup(page_url)
-            scraper.validate_listing_page(soup, page_url)
+            soup = scraper.get_soup(page_url, expected="listing")
 
             reached_thread_limit = False
             for link in scraper.listing_threads(soup, page_url):
-                if args.keyword not in link.title or link.thread_id in completed_ids:
+                if (
+                    args.keyword not in link.title
+                    or link.thread_id in completed_ids
+                    or link.thread_id in failed_this_run
+                ):
                     continue
                 if args.max_threads and len(completed_ids) >= args.max_threads:
                     reached_thread_limit = True
                     break
                 logging.info('MATCH [%s] "%s"', link.thread_id, link.title)
-                thread = scraper.scrape_thread(link)
+                try:
+                    thread = scraper.scrape_thread(link)
+                except KeyboardInterrupt:
+                    raise
+                except RedirectedPageError:
+                    raise
+                except Exception as exc:
+                    failures[link.thread_id] = failure_record(
+                        link,
+                        exc,
+                        previous=failures.get(link.thread_id),
+                        status="failed",
+                    )
+                    failed_this_run.add(link.thread_id)
+                    state["failed_thread_count"] = len(failures)
+                    state["last_thread_error"] = (
+                        f"{link.thread_id}: {type(exc).__name__}: {exc}"
+                    )
+                    state["updated_at"] = timestamp_now()
+                    save_failure_logs(failure_jsonl_path, failure_csv_path, failures)
+                    save_checkpoint(checkpoint_path, state)
+                    logging.error(
+                        "THREAD FAILED [%s] after retries; logged and continuing: %s",
+                        link.thread_id,
+                        exc,
+                    )
+                    continue
                 append_thread_jsonl(jsonl_path, thread)
                 append_thread_csv(csv_path, thread)
                 threads.append(thread)
                 completed_ids.add(link.thread_id)
+                if link.thread_id in failures:
+                    failures.pop(link.thread_id)
+                    save_failure_logs(failure_jsonl_path, failure_csv_path, failures)
                 state["completed_thread_count"] = len(completed_ids)
-                state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+                state["failed_thread_count"] = len(failures)
+                state["updated_at"] = timestamp_now()
                 save_checkpoint(checkpoint_path, state)
 
             if reached_thread_limit:
@@ -535,11 +777,11 @@ def main() -> int:
             page_url = scraper.next_listing_url(soup, page_url)
             state["listing_pages_completed"] = pages_completed
             state["current_forum_url"] = page_url
-            state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            state["updated_at"] = timestamp_now()
             save_checkpoint(checkpoint_path, state)
 
         if page_url is None:
-            state["status"] = "complete"
+            state["status"] = "complete_with_failures" if failures else "complete"
         elif page_url in pages_seen_this_run and state["status"] == "running":
             raise RuntimeError(f"Listing pagination loop detected at {page_url}")
     except KeyboardInterrupt:
@@ -556,13 +798,15 @@ def main() -> int:
         state["current_forum_url"] = page_url
         state["listing_pages_completed"] = pages_completed
         state["completed_thread_count"] = len(completed_ids)
-        state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        state["failed_thread_count"] = len(failures)
+        state["updated_at"] = timestamp_now()
         save_checkpoint(checkpoint_path, state)
 
     print(
         f"Status: {state['status']}. Saved {len(threads)} matching thread(s), "
         f"{sum(1 + t['comment_count_scraped'] for t in threads if t['opening_post'])} post(s).\n"
-        f"JSONL: {jsonl_path}\nCSV:   {csv_path}\nCheckpoint: {checkpoint_path}"
+        f"JSONL: {jsonl_path}\nCSV:   {csv_path}\nCheckpoint: {checkpoint_path}\n"
+        f"Failures: {failure_csv_path}"
     )
     if exit_code:
         print("Run the same command again to resume from the checkpoint.")
